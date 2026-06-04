@@ -1,0 +1,644 @@
+/** HTTP + WebSocket 服务 */
+
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer, WebSocket } from 'ws';
+import clipboardy from 'clipboardy';
+import type { ServerConfig } from './config.js';
+import type { MessageEntry } from './history.js';
+import { _ } from './i18n.js';
+import { generateQrPng, generateQrHtml } from './qr.js';
+import { getFileTransferManager } from './file-transfer.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+export class AsyncQueue<T> {
+  private queue: T[] = [];
+  private resolvers: Array<{ resolve: (v: T) => void; reject: (e: Error) => void }> = [];
+  private closed = false;
+
+  put(item: T) {
+    if (this.closed) return;
+    if (this.resolvers.length > 0) {
+      this.resolvers.shift()!.resolve(item);
+    } else {
+      this.queue.push(item);
+    }
+  }
+
+  putError(error: Error) {
+    if (this.resolvers.length > 0) {
+      this.resolvers.shift()!.reject(error);
+    } else {
+      this.queue.push(error as unknown as T);
+    }
+  }
+
+  async get(): Promise<T> {
+    if (this.queue.length > 0) {
+      const item = this.queue.shift()!;
+      if (item instanceof Error) throw item;
+      return item;
+    }
+    return new Promise((resolve, reject) => {
+      this.resolvers.push({ resolve, reject });
+    });
+  }
+
+  close(error?: Error) {
+    this.closed = true;
+    const err = error || new Error('Queue closed');
+    while (this.resolvers.length > 0) {
+      this.resolvers.shift()!.reject(err);
+    }
+  }
+}
+
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Timeout')), ms);
+    promise.then((v) => { clearTimeout(timer); resolve(v); }).catch((e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
+export interface TerminalMessage {
+  type: 'new_message' | 'clipboard_error' | 'file_received' | 'server_message_sent';
+  entry?: MessageEntry;
+  autoCopied?: boolean;
+  error?: string;
+  path?: string;
+  name?: string;
+  size?: number;
+}
+
+export interface DeviceInfo {
+  deviceName: string;
+  loginId: string;
+  loginTime: Date;
+  ws: WebSocket | null;
+}
+
+export class Server {
+  config: ServerConfig;
+  private httpServer: http.Server | null = null;
+  private wss: WebSocketServer | null = null;
+  terminalQueue = new AsyncQueue<TerminalMessage | null>();
+
+  verifiedClients: Set<WebSocket> = new Set();
+  devices: Map<string, DeviceInfo> = new Map(); // loginId -> DeviceInfo
+  wsToLoginId: WeakMap<WebSocket, string> = new WeakMap();
+  deviceRegistry: Map<string, string> = new Map(); // deviceName -> loginId
+  fileRegistry: Map<string, string> = new Map(); // fileId -> filepath
+
+  constructor(config: ServerConfig) {
+    this.config = config;
+  }
+
+  private findStaticFile(filename: string): string | null {
+    const candidates = [
+      path.join(__dirname, 'static', filename),
+      path.join(__dirname, '..', 'static', filename),
+      path.join(__dirname, '..', '..', 'static', filename),
+    ];
+    for (const p of candidates) {
+      if (fs.existsSync(p)) return p;
+    }
+    return null;
+  }
+
+  async start(): Promise<number> {
+    this.httpServer = http.createServer((req, res) => {
+      const url = new URL(req.url || '/', `http://${req.headers.host}`);
+      if (url.pathname === '/') {
+        this.handleIndex(req, res);
+      } else if (url.pathname === '/qr') {
+        this.handleQrPage(req, res);
+      } else if (url.pathname === '/qr.png') {
+        this.handleQrImage(req, res);
+      } else if (url.pathname.startsWith('/files/')) {
+        this.handleFileDownload(req, res);
+      } else {
+        res.writeHead(404);
+        res.end('Not found');
+      }
+    });
+
+    this.wss = new WebSocketServer({ noServer: true });
+    this.wss.on('connection', (ws) => {
+      this.handleWebsocket(ws);
+    });
+
+    this.httpServer.on('upgrade', (request, socket, head) => {
+      const url = new URL(request.url || '/', `http://${request.headers.host}`);
+      if (url.pathname === '/ws') {
+        this.wss!.handleUpgrade(request, socket, head, (ws) => {
+          this.wss!.emit('connection', ws, request);
+        });
+      } else {
+        socket.destroy();
+      }
+    });
+
+    let port = this.config.port;
+    const maxAttempts = 10;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          this.httpServer!.once('error', reject);
+          this.httpServer!.listen(port, this.config.host, () => {
+            this.httpServer!.off('error', reject);
+            resolve();
+          });
+        });
+        this.config.port = port;
+        return port;
+      } catch (err: any) {
+        if (err.code === 'EADDRINUSE' && attempt < maxAttempts - 1) {
+          port += 1;
+        } else {
+          throw new Error(_('Could not bind port {start}-{end}', { start: this.config.port, end: port }));
+        }
+      }
+    }
+    return port;
+  }
+
+  async stop(force: boolean = true): Promise<void> {
+    if (this.verifiedClients.size > 0) {
+      const closeMsg = JSON.stringify({ type: 'server_close', message: _('Service closed') });
+      for (const client of this.verifiedClients) {
+        if (client.readyState === WebSocket.OPEN) {
+          try { client.send(closeMsg); } catch {}
+        }
+      }
+      for (const client of this.verifiedClients) {
+        if (client.readyState === WebSocket.OPEN) {
+          try { client.close(); } catch {}
+        }
+      }
+      this.verifiedClients.clear();
+      this.config.connectedClients.clear();
+    }
+
+    return new Promise((resolve) => {
+      this.wss?.close(() => {
+        this.httpServer?.close(() => {
+          resolve();
+        });
+      });
+    });
+  }
+
+  private handleIndex(_req: http.IncomingMessage, res: http.ServerResponse) {
+    const indexFile = this.findStaticFile('index.html');
+    if (indexFile) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      fs.createReadStream(indexFile).pipe(res);
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(_('index.html not found'));
+    }
+  }
+
+  private handleQrPage(_req: http.IncomingMessage, res: http.ServerResponse) {
+    const html = generateQrHtml(this.config.qrUrl);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  }
+
+  private async handleQrImage(_req: http.IncomingMessage, res: http.ServerResponse) {
+    try {
+      const buffer = await generateQrPng(this.config.qrUrl);
+      res.writeHead(200, { 'Content-Type': 'image/png' });
+      res.end(buffer);
+    } catch {
+      res.writeHead(500);
+      res.end('QR generation failed');
+    }
+  }
+
+  private handleFileDownload(req: http.IncomingMessage, res: http.ServerResponse) {
+    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    const fileId = url.pathname.replace('/files/', '');
+    const filePath = this.fileRegistry.get(fileId);
+    if (!filePath || !fs.existsSync(filePath)) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(_('File not found'));
+      return;
+    }
+    res.writeHead(200);
+    fs.createReadStream(filePath).pipe(res);
+  }
+
+  private _generateLoginId(): string {
+    return Array.from({ length: 8 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  }
+
+  private _getOnlineDeviceNames(): Set<string> {
+    const names = new Set<string>();
+    for (const info of this.devices.values()) {
+      if (info.ws && info.ws.readyState === WebSocket.OPEN) {
+        names.add(info.deviceName);
+      }
+    }
+    return names;
+  }
+
+  getDeviceByWs(ws: WebSocket): DeviceInfo | null {
+    const loginId = this.wsToLoginId.get(ws);
+    if (loginId) return this.devices.get(loginId) || null;
+    return null;
+  }
+
+  async sendToDevice(loginId: string, message: object): Promise<boolean> {
+    const device = this.devices.get(loginId);
+    if (device?.ws && device.ws.readyState === WebSocket.OPEN) {
+      try {
+        device.ws.send(JSON.stringify(message));
+        return true;
+      } catch {}
+    }
+    return false;
+  }
+
+  async broadcast(message: object): Promise<void> {
+    const data = JSON.stringify(message);
+    for (const client of this.verifiedClients) {
+      if (client.readyState === WebSocket.OPEN) {
+        try { client.send(data); } catch {}
+      }
+    }
+  }
+
+  private async handleWebsocket(ws: WebSocket) {
+    const messageQueue = new AsyncQueue<WebSocket.RawData>();
+    ws.on('message', (data) => messageQueue.put(data));
+    ws.on('close', () => messageQueue.close());
+
+    // 1. 等待配对码验证
+    let authenticated = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const rawData = await withTimeout(messageQueue.get(), 10000);
+        const data = JSON.parse(rawData.toString());
+        if (data.type === 'auth') {
+          if (data.code !== this.config.pairingCode) {
+            ws.send(JSON.stringify({ type: 'auth_failed', message: _('Incorrect pairing code') }));
+            continue;
+          }
+          ws.send(JSON.stringify({ type: 'auth_success' }));
+          authenticated = true;
+          break;
+        } else {
+          ws.send(JSON.stringify({ type: 'auth_failed', message: _('Please send pairing code first') }));
+          continue;
+        }
+      } catch {
+        ws.send(JSON.stringify({ type: 'auth_failed', message: _('Connection timed out, please re-enter pairing code') }));
+        continue;
+      }
+    }
+
+    if (!authenticated) {
+      ws.close();
+      return;
+    }
+
+    // 2. 等待设备注册
+    let registered = false;
+    let deviceInfo: DeviceInfo | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const rawData = await withTimeout(messageQueue.get(), 10000);
+        const data = JSON.parse(rawData.toString());
+        if (data.type === 'register') {
+          const deviceName = String(data.device_name || '').trim();
+          if (!deviceName) {
+            ws.send(JSON.stringify({ type: 'register_failed', message: _('Device name cannot be empty') }));
+            continue;
+          }
+          const onlineNames = this._getOnlineDeviceNames();
+          if (onlineNames.has(deviceName)) {
+            ws.send(JSON.stringify({ type: 'register_failed', message: _("Device name '{name}' is already in use", { name: deviceName }) }));
+            continue;
+          }
+
+          let loginId: string;
+          if (this.deviceRegistry.has(deviceName)) {
+            loginId = this.deviceRegistry.get(deviceName)!;
+          } else {
+            loginId = this._generateLoginId();
+            while (this.devices.has(loginId)) {
+              loginId = this._generateLoginId();
+            }
+            this.deviceRegistry.set(deviceName, loginId);
+          }
+
+          deviceInfo = {
+            deviceName,
+            loginId,
+            loginTime: new Date(),
+            ws,
+          };
+          this.devices.set(loginId, deviceInfo);
+          this.wsToLoginId.set(ws, loginId);
+
+          ws.send(JSON.stringify({
+            type: 'register_success',
+            login_id: loginId,
+            device_name: deviceName,
+          }));
+          registered = true;
+          break;
+        } else {
+          ws.send(JSON.stringify({ type: 'register_failed', message: _('Please send device registration info first') }));
+          continue;
+        }
+      } catch {
+        ws.send(JSON.stringify({ type: 'register_failed', message: _('Registration timed out, please reconnect') }));
+        continue;
+      }
+    }
+
+    if (!registered || !deviceInfo) {
+      ws.close();
+      return;
+    }
+
+    // 3. 注册客户端到在线集合
+    this.config.connectedClients.add(ws);
+    this.verifiedClients.add(ws);
+
+    try {
+      // 4. 发送历史记录（只发送与该设备相关的）
+      const currentLoginId = deviceInfo.loginId;
+      const filteredHistory = this.config.history.list()
+        .filter(e => e.loginId === currentLoginId || e.targetLoginId === currentLoginId)
+        .map(e => ({
+          id: e.id,
+          text: e.text,
+          time: e.time.toISOString(),
+          preview: e.preview,
+          session_id: e.sessionId,
+          device_name: e.deviceName,
+          login_id: e.loginId,
+          target_login_id: e.targetLoginId,
+          file_id: e.fileId,
+          file_name: e.fileName,
+          file_size: e.fileSize,
+          mime_type: e.mimeType,
+        }));
+      ws.send(JSON.stringify({ type: 'history', data: filteredHistory }));
+
+      // 5. 监听消息
+      while (true) {
+        const rawData = await messageQueue.get();
+        try {
+          const data = JSON.parse(rawData.toString());
+          const msgType = data.type;
+          if (msgType === 'text') {
+            await this._handleTextMessage(String(data.content || ''), ws, data.client_id);
+          } else if (msgType === 'file_start') {
+            await this._handleFileStart(data, ws);
+          } else if (msgType === 'file_chunk') {
+            await this._handleFileChunk(data, ws);
+          } else if (msgType === 'file_end') {
+            await this._handleFileEnd(data, ws);
+          } else if (msgType === 'command') {
+            await this._handleCommand(data, ws);
+          }
+        } catch {
+          // ignore parse error
+        }
+      }
+    } catch {
+      // connection closed or queue closed
+    } finally {
+      // 6. 注销客户端
+      this.config.connectedClients.delete(ws);
+      this.verifiedClients.delete(ws);
+      const loginId = this.wsToLoginId.get(ws);
+      if (loginId) {
+        this.wsToLoginId.delete(ws);
+        const dev = this.devices.get(loginId);
+        if (dev) dev.ws = null;
+      }
+    }
+  }
+
+  private async _handleTextMessage(text: string, sender: WebSocket, clientId?: string) {
+    if (!text) return;
+    const device = this.getDeviceByWs(sender);
+    const deviceName = device?.deviceName || '';
+    const loginId = device?.loginId || '';
+
+    if (this.config.copyMode === 'cover') {
+      this.config.newSession();
+    }
+    const sessionId = this.config.currentSessionId;
+    const entry = this.config.history.add(text, sessionId, deviceName, loginId);
+
+    let autoCopied = false;
+    if (this.config.autoCopy) {
+      try {
+        let copyText: string;
+        if (this.config.copyMode === 'add') {
+          if (this.config.sessionBuffer) {
+            this.config.sessionBuffer += '\n' + text;
+          } else {
+            this.config.sessionBuffer = text;
+          }
+          copyText = this.config.sessionBuffer;
+        } else {
+          copyText = text;
+        }
+        await clipboardy.write(copyText);
+        autoCopied = true;
+      } catch (e: any) {
+        this.terminalQueue.put({ type: 'clipboard_error', error: e.message || _('Unknown error') });
+      }
+    }
+
+    this.terminalQueue.put({ type: 'new_message', entry, autoCopied });
+
+    const messageData = {
+      type: 'new',
+      data: {
+        id: entry.id,
+        text: entry.text,
+        time: entry.time.toISOString(),
+        preview: entry.preview,
+        client_id: clientId,
+        session_id: entry.sessionId,
+        device_name: entry.deviceName,
+        login_id: entry.loginId,
+      },
+    };
+
+    if (device) {
+      await this.sendToDevice(device.loginId, messageData);
+    }
+  }
+
+  private async _handleFileStart(data: any, sender: WebSocket) {
+    const ftm = getFileTransferManager();
+    const name = String(data.name || '');
+    const size = Number(data.size || 0);
+    const mimeType = String(data.mime_type || '');
+    const [fileId, error] = ftm.startTransfer(name, size, mimeType);
+    if (fileId) {
+      sender.send(JSON.stringify({ type: 'file_accept', file_id: fileId }));
+    } else {
+      sender.send(JSON.stringify({ type: 'file_error', error }));
+    }
+  }
+
+  private async _handleFileChunk(data: any, sender: WebSocket) {
+    const ftm = getFileTransferManager();
+    const fileId = String(data.file_id || '');
+    const chunkData = Buffer.from(String(data.data || ''), 'base64');
+    const index = Number(data.index || 0);
+    const [success, error] = ftm.receiveChunk(fileId, chunkData, index);
+    if (success) {
+      const [received, total] = ftm.getTransferProgress(fileId);
+      sender.send(JSON.stringify({ type: 'file_progress', file_id: fileId, received, total }));
+    } else {
+      sender.send(JSON.stringify({ type: 'file_error', file_id: fileId, error }));
+    }
+  }
+
+  private async _handleFileEnd(data: any, sender: WebSocket) {
+    const ftm = getFileTransferManager();
+    const fileId = String(data.file_id || '');
+    const [savePath, error] = ftm.completeTransfer(fileId);
+    if (savePath) {
+      const stats = fs.statSync(savePath);
+      sender.send(JSON.stringify({ type: 'file_saved', file_id: fileId, path: savePath, size: stats.size }));
+      this.terminalQueue.put({ type: 'file_received', path: savePath, name: path.basename(savePath), size: stats.size });
+    } else {
+      sender.send(JSON.stringify({ type: 'file_error', file_id: fileId, error }));
+    }
+  }
+
+  async sendServerText(text: string, targetLoginId: string): Promise<MessageEntry | null> {
+    if (!text || !targetLoginId) return null;
+    const sessionId = -(this.config.history.counterValue + 1);
+    const entry = this.config.history.add(text, sessionId, _('Server'), 'server', targetLoginId);
+
+    const messageData = {
+      type: 'server_text',
+      data: {
+        id: entry.id,
+        text: entry.text,
+        time: entry.time.toISOString(),
+        preview: entry.preview,
+        session_id: entry.sessionId,
+        device_name: entry.deviceName,
+        login_id: entry.loginId,
+      },
+    };
+
+    await this.sendToDevice(targetLoginId, messageData);
+    this.terminalQueue.put({ type: 'server_message_sent', entry });
+    return entry;
+  }
+
+  async sendServerFile(filepath: string, targetLoginId: string): Promise<Record<string, unknown> | null> {
+    if (!filepath || !targetLoginId) return null;
+    if (!fs.existsSync(filepath) || !fs.statSync(filepath).isFile()) return null;
+
+    const device = this.devices.get(targetLoginId);
+    if (!device?.ws || device.ws.readyState !== WebSocket.OPEN) return null;
+
+    const stats = fs.statSync(filepath);
+    const fileSize = stats.size;
+    const fileName = path.basename(filepath);
+
+    const mimeMap: Record<string, string> = {
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.png': 'image/png', '.gif': 'image/gif',
+      '.webp': 'image/webp', '.mp4': 'video/mp4',
+      '.mov': 'video/quicktime', '.webm': 'video/webm',
+      '.avi': 'video/x-msvideo', '.pdf': 'application/pdf',
+      '.txt': 'text/plain', '.json': 'application/json',
+      '.md': 'text/markdown', '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.xls': 'application/vnd.ms-excel',
+      '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      '.zip': 'application/zip',
+    };
+    const ext = path.extname(filepath).toLowerCase();
+    let mimeType = mimeMap[ext] || 'application/octet-stream';
+
+    const fileId = Array.from({ length: 8 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+    this.fileRegistry.set(fileId, filepath);
+
+    const sessionId = -(this.config.history.counterValue + 1);
+    this.config.history.add(
+      `[文件] ${fileName}`, sessionId, _('Server'), 'server', targetLoginId,
+      fileId, fileName, fileSize, mimeType
+    );
+
+    const chunkSize = 64 * 1024;
+    const chunks: string[] = [];
+    const fd = fs.openSync(filepath, 'r');
+    try {
+      let buffer = Buffer.alloc(chunkSize);
+      let bytesRead: number;
+      while ((bytesRead = fs.readSync(fd, buffer, 0, chunkSize, null)) > 0) {
+        chunks.push(buffer.subarray(0, bytesRead).toString('base64'));
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    device.ws.send(JSON.stringify({
+      type: 'server_file_start',
+      file_id: fileId,
+      name: fileName,
+      size: fileSize,
+      mime_type: mimeType,
+      total_chunks: chunks.length,
+    }));
+
+    for (let i = 0; i < chunks.length; i++) {
+      device.ws.send(JSON.stringify({
+        type: 'server_file_chunk',
+        file_id: fileId,
+        index: i,
+        data: chunks[i],
+      }));
+    }
+
+    device.ws.send(JSON.stringify({ type: 'server_file_end', file_id: fileId }));
+
+    return { file_id: fileId, name: fileName, size: fileSize, mime_type: mimeType };
+  }
+
+  private async _handleCommand(data: any, sender: WebSocket) {
+    const command = String(data.command || '');
+    if (command === 'new_session') {
+      if (this.config.copyMode === 'add') {
+        this.config.newSession();
+        sender.send(JSON.stringify({ type: 'session_reset', message: _('Session refreshed') }));
+      }
+    } else if (command === 'set_mode') {
+      const mode = String(data.mode || '');
+      if (mode === 'cover' || mode === 'add') {
+        const oldMode = this.config.copyMode;
+        if (oldMode !== mode) {
+          this.config.copyMode = mode;
+          this.config.newSession();
+          if (mode === 'cover') this.config.sessionBuffer = '';
+        }
+        await this.broadcast({
+          type: 'mode_changed',
+          mode,
+          message: mode === 'add' ? _('Switched to append mode') : _('Switched to cover mode'),
+        });
+      }
+    }
+  }
+}

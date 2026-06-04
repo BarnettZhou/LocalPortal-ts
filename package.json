@@ -1,0 +1,35 @@
+{
+  "name": "localportal-ts",
+  "version": "0.1.0",
+  "description": "局域网语音输入中转工具 - 本地传送门 (TypeScript)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "lportal": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": ["voice", "clipboard", "lan", "websocket"],
+  "author": "Local Portal",
+  "license": "MIT",
+  "dependencies": {
+    "cac": "^6.7.14",
+    "chalk": "^5.3.0",
+    "clipboardy": "^4.0.0",
+    "qrcode": "^1.5.3",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

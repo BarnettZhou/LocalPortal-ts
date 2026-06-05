@@ -10,7 +10,7 @@ import type { ServerConfig } from './config.js';
 import type { MessageEntry } from './history.js';
 import { _ } from './i18n.js';
 import { generateQrPng, generateQrHtml } from './qr.js';
-import { getFileTransferManager } from './file-transfer.js';
+import { getFileTransferManager, FileTransferManager } from './file-transfer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -117,6 +117,12 @@ export class Server {
         this.handleQrPage(req, res);
       } else if (url.pathname === '/qr.png') {
         this.handleQrImage(req, res);
+      } else if (url.pathname === '/upload/init') {
+        this.handleUploadInit(req, res);
+      } else if (url.pathname.startsWith('/upload/chunk/')) {
+        this.handleUploadChunk(req, res);
+      } else if (url.pathname.startsWith('/upload/complete/')) {
+        this.handleUploadComplete(req, res);
       } else if (url.pathname.startsWith('/files/')) {
         this.handleFileDownload(req, res);
       } else {
@@ -219,6 +225,103 @@ export class Server {
     }
   }
 
+  // ==================== HTTP 流式上传 ====================
+
+  private handleUploadInit(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    const name = decodeURIComponent(url.searchParams.get('name') || '');
+    const size = Number(url.searchParams.get('size') || 0);
+    const mimeType = decodeURIComponent(url.searchParams.get('mime') || '');
+    const loginId = url.searchParams.get('login_id') || '';
+
+    if (!name) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing file name' }));
+      return;
+    }
+
+    const ftm = getFileTransferManager();
+    const [fileId, error] = ftm.startTransfer(name, size, mimeType, loginId || undefined);
+
+    if (fileId) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ fileId, chunkSize: FileTransferManager.CHUNK_SIZE }));
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error }));
+    }
+  }
+
+  private handleUploadChunk(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    const parts = url.pathname.split('/');
+    const fileId = parts[3] || '';
+    const index = Number(parts[4] || 0);
+
+    const ftm = getFileTransferManager();
+    const fileInfo = ftm.activeTransfers.get(fileId);
+    if (!fileInfo) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: '传输不存在或已过期' }));
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      const buffer = Buffer.concat(chunks);
+      const [success, error] = ftm.receiveChunk(fileId, buffer, index);
+      if (success) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, received: fileInfo.receivedSize }));
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error }));
+      }
+    });
+    req.on('error', (err) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Upload error: ${err.message}` }));
+    });
+  }
+
+  private handleUploadComplete(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    const parts = url.pathname.split('/');
+    const fileId = parts[3] || '';
+
+    const ftm = getFileTransferManager();
+    const [savePath, error] = ftm.completeTransfer(fileId);
+
+    if (savePath) {
+      const stats = fs.statSync(savePath);
+      const fileName = path.basename(savePath);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, path: savePath, size: stats.size }));
+      this.terminalQueue.put({ type: 'file_received', path: savePath, name: fileName, size: stats.size });
+    } else {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error }));
+    }
+  }
+
+  // ==================== HTTP 文件下载（支持 Range）====================
+
   private handleFileDownload(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
     const fileId = url.pathname.replace('/files/', '');
@@ -228,8 +331,53 @@ export class Server {
       res.end(_('File not found'));
       return;
     }
-    res.writeHead(200);
-    fs.createReadStream(filePath).pipe(res);
+
+    const stats = fs.statSync(filePath);
+    const mimeMap: Record<string, string> = {
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.png': 'image/png', '.gif': 'image/gif',
+      '.webp': 'image/webp', '.mp4': 'video/mp4',
+      '.mov': 'video/quicktime', '.webm': 'video/webm',
+      '.avi': 'video/x-msvideo', '.pdf': 'application/pdf',
+      '.txt': 'text/plain', '.json': 'application/json',
+      '.md': 'text/markdown', '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.xls': 'application/vnd.ms-excel',
+      '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      '.zip': 'application/zip',
+    };
+    const ext = path.extname(filePath).toLowerCase();
+    const mimeType = mimeMap[ext] || 'application/octet-stream';
+
+    const range = req.headers.range;
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : stats.size - 1;
+      if (isNaN(start) || start >= stats.size || end >= stats.size || start > end) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${stats.size}`,
+          'Content-Type': mimeType,
+        });
+        res.end();
+        return;
+      }
+      const chunkSize = end - start + 1;
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${stats.size}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunkSize,
+        'Content-Type': mimeType,
+      });
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+    } else {
+      res.writeHead(200, {
+        'Content-Length': stats.size,
+        'Content-Type': mimeType,
+        'Accept-Ranges': 'bytes',
+      });
+      fs.createReadStream(filePath).pipe(res);
+    }
   }
 
   private _generateLoginId(): string {
@@ -406,6 +554,8 @@ export class Server {
             await this._handleFileChunk(data, ws);
           } else if (msgType === 'file_end') {
             await this._handleFileEnd(data, ws);
+          } else if (msgType === 'file_cancel') {
+            await this._handleFileCancel(data, ws);
           } else if (msgType === 'command') {
             await this._handleCommand(data, ws);
           }
@@ -482,12 +632,16 @@ export class Server {
     }
   }
 
+  // ---------------- 兼容 WS 文件传输（内部已改为流式） ----------------
+
   private async _handleFileStart(data: any, sender: WebSocket) {
     const ftm = getFileTransferManager();
     const name = String(data.name || '');
     const size = Number(data.size || 0);
     const mimeType = String(data.mime_type || '');
-    const [fileId, error] = ftm.startTransfer(name, size, mimeType);
+    const device = this.getDeviceByWs(sender);
+    const loginId = device?.loginId || '';
+    const [fileId, error] = ftm.startTransfer(name, size, mimeType, loginId || undefined);
     if (fileId) {
       sender.send(JSON.stringify({ type: 'file_accept', file_id: fileId }));
     } else {
@@ -522,6 +676,12 @@ export class Server {
     }
   }
 
+  private async _handleFileCancel(data: any, _sender: WebSocket) {
+    const ftm = getFileTransferManager();
+    const fileId = String(data.file_id || '');
+    ftm.cancelTransfer(fileId);
+  }
+
   async sendServerText(text: string, targetLoginId: string): Promise<MessageEntry | null> {
     if (!text || !targetLoginId) return null;
     const sessionId = -(this.config.history.counterValue + 1);
@@ -544,6 +704,8 @@ export class Server {
     this.terminalQueue.put({ type: 'server_message_sent', entry });
     return entry;
   }
+
+  // ---------------- 服务端发文件：改用 HTTP 下载链接 ----------------
 
   async sendServerFile(filepath: string, targetLoginId: string): Promise<Record<string, unknown> | null> {
     if (!filepath || !targetLoginId) return null;
@@ -581,38 +743,15 @@ export class Server {
       fileId, fileName, fileSize, mimeType
     );
 
-    const chunkSize = 64 * 1024;
-    const chunks: string[] = [];
-    const fd = fs.openSync(filepath, 'r');
-    try {
-      let buffer = Buffer.alloc(chunkSize);
-      let bytesRead: number;
-      while ((bytesRead = fs.readSync(fd, buffer, 0, chunkSize, null)) > 0) {
-        chunks.push(buffer.subarray(0, bytesRead).toString('base64'));
-      }
-    } finally {
-      fs.closeSync(fd);
-    }
-
-    device.ws.send(JSON.stringify({
-      type: 'server_file_start',
+    // 发送轻量 WS 消息，客户端通过 HTTP 流式下载
+    await this.sendToDevice(targetLoginId, {
+      type: 'server_file_ready',
       file_id: fileId,
       name: fileName,
       size: fileSize,
       mime_type: mimeType,
-      total_chunks: chunks.length,
-    }));
-
-    for (let i = 0; i < chunks.length; i++) {
-      device.ws.send(JSON.stringify({
-        type: 'server_file_chunk',
-        file_id: fileId,
-        index: i,
-        data: chunks[i],
-      }));
-    }
-
-    device.ws.send(JSON.stringify({ type: 'server_file_end', file_id: fileId }));
+      download_url: `/files/${fileId}`,
+    });
 
     return { file_id: fileId, name: fileName, size: fileSize, mime_type: mimeType };
   }

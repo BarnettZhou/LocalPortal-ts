@@ -323,12 +323,7 @@ export class CommandHandler {
         results.push(`${_('[!] Not a file')}: ${filepath}`);
         continue;
       }
-      const maxSize = 100 * 1024 * 1024;
       const fileSize = fs.statSync(resolved).size;
-      if (fileSize > maxSize) {
-        results.push(`${_('[!] File too large')}: ${(fileSize / 1024 / 1024).toFixed(1)}MB (${_('max 100MB')})`);
-        continue;
-      }
       try {
         const result = await this.server.sendServerFile(resolved, this.app.linkedLoginId);
         if (result) {

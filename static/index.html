@@ -1660,106 +1660,42 @@
                     scrollToBottom();
                     break;
                     
-                case 'server_file_start':
-                    // 服务端开始发送文件
-                    serverFileReceive = {
-                        file_id: data.file_id,
-                        name: data.name,
-                        size: data.size,
-                        mime_type: data.mime_type,
-                        chunks: new Array(data.total_chunks).fill(null),
-                        received_chunks: 0,
-                        total_chunks: data.total_chunks
-                    };
-                    break;
-                    
-                case 'server_file_chunk':
-                    // 接收文件分片，每个分片单独解码为 Uint8Array
-                    // 避免把多个独立 base64 字符串拼接后再统一解码（中间的 = 填充符会导致 atob 失败）
-                    if (serverFileReceive.file_id === data.file_id) {
-                        try {
-                            const binaryString = atob(data.data);
-                            const bytes = new Uint8Array(binaryString.length);
-                            for (let i = 0; i < binaryString.length; i++) {
-                                bytes[i] = binaryString.charCodeAt(i);
-                            }
-                            serverFileReceive.chunks[data.index] = bytes;
-                            serverFileReceive.received_chunks++;
-                        } catch (err) {
-                            console.error('分片解码失败:', err);
+                case 'server_file_ready':
+                    // 服务端通过 HTTP 提供文件下载（流式，支持大文件）
+                    {
+                        const dlUrl = data.download_url || `/files/${data.file_id}`;
+                        let mediaType = '';
+                        if (data.mime_type && data.mime_type.startsWith('image/')) {
+                            mediaType = 'image';
+                        } else if (data.mime_type && data.mime_type.startsWith('video/')) {
+                            mediaType = 'video';
                         }
+                        const fileMsg = {
+                            id: Date.now(),
+                            text: `[文件] ${data.name} (${formatSize(data.size)})`,
+                            preview: `[文件] ${data.name}`,
+                            time: new Date().toISOString(),
+                            session_id: -Date.now(),
+                            device_name: '服务端',
+                            login_id: 'server',
+                            media_type: mediaType,
+                            media_url: mediaType ? dlUrl : '',
+                            download_url: mediaType ? '' : dlUrl,
+                            download_name: data.name,
+                            file_id: data.file_id,
+                            size: data.size
+                        };
+                        messages.push(fileMsg);
+                        renderMessages();
+                        scrollToBottom();
+                        showToast(`已接收文件: ${data.name}`, 'success');
                     }
                     break;
                     
+                // 以下保留兼容旧版 WS 二进制分片推送（已不再使用）
+                case 'server_file_start':
+                case 'server_file_chunk':
                 case 'server_file_end':
-                    // 文件接收完成，组装并展示/下载
-                    if (serverFileReceive.file_id === data.file_id) {
-                        // 立即拷贝引用并重置全局缓存，避免批量发送时下一文件覆盖
-                        const receive = serverFileReceive;
-                        serverFileReceive = {
-                            file_id: null,
-                            name: '',
-                            size: 0,
-                            mime_type: '',
-                            chunks: [],
-                            received_chunks: 0,
-                            total_chunks: 0
-                        };
-                        (async () => {
-                            try {
-                                // 检查是否所有分片都已收到
-                                if (receive.received_chunks !== receive.total_chunks) {
-                                    throw new Error(`分片不完整: ${receive.received_chunks}/${receive.total_chunks}`);
-                                }
-
-                                // 拼接所有 Uint8Array
-                                const totalLength = receive.chunks.reduce((acc, arr) => acc + arr.length, 0);
-                                const combined = new Uint8Array(totalLength);
-                                let offset = 0;
-                                for (const arr of receive.chunks) {
-                                    combined.set(arr, offset);
-                                    offset += arr.length;
-                                }
-                                const blob = new Blob([combined], { type: receive.mime_type });
-                                const blobUrl = URL.createObjectURL(blob);
-
-                                // 判断媒体类型：图片/视频直接展示在对话框，其他文件触发下载
-                                let mediaType = '';
-                                if (receive.mime_type.startsWith('image/')) {
-                                    mediaType = 'image';
-                                } else if (receive.mime_type.startsWith('video/')) {
-                                    mediaType = 'video';
-                                }
-
-                                const fileMsg = {
-                                    id: Date.now(),
-                                    text: `[文件] ${receive.name} (${(receive.size / 1024).toFixed(1)}KB)`,
-                                    preview: `[文件] ${receive.name}`,
-                                    time: new Date().toISOString(),
-                                    session_id: -Date.now(),
-                                    device_name: '服务端',
-                                    login_id: 'server',
-                                    media_type: mediaType,
-                                    media_url: mediaType ? blobUrl : '',
-                                    download_url: mediaType ? '' : blobUrl,
-                                    download_name: receive.name,
-                                    file_id: receive.file_id
-                                };
-                                messages.push(fileMsg);
-                                renderMessages();
-                                scrollToBottom();
-
-                                if (mediaType) {
-                                    showToast(`已接收${mediaType === 'image' ? '图片' : '视频'}: ${receive.name}`, 'success');
-                                } else {
-                                    showToast(`已接收文件: ${receive.name}`, 'success');
-                                }
-                            } catch (err) {
-                                console.error('文件接收失败:', err);
-                                showToast('文件接收失败', 'error');
-                            }
-                        })();
-                    }
                     break;
                     
                 case 'server_close':
@@ -2087,7 +2023,7 @@
         // 取消传输
         cancelTransferBtn.addEventListener('click', () => {
             if (currentFileTransfer) {
-                currentFileTransfer = null;
+                currentFileTransfer.cancelled = true;
                 hideFileProgress();
                 showToast('已取消传输', 'warning');
             }
@@ -2106,6 +2042,14 @@
             sendMessage(fullscreenTextarea.value, true);
         });
 
+        // 格式化文件大小（全局复用）
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+            return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+        }
+
         // 文件传输相关变量
         let currentFileTransfer = null;
         
@@ -2122,20 +2066,12 @@
         
         // 更新传输进度
         function updateFileProgress(received, total) {
-            const percent = Math.round((received / total) * 100);
+            const percent = total > 0 ? Math.round((received / total) * 100) : 0;
             progressFill.style.width = percent + '%';
-            
-            // 格式化大小显示
-            const formatSize = (bytes) => {
-                if (bytes < 1024) return bytes + ' B';
-                if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-                return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-            };
-            
             progressText.textContent = `${percent}% (${formatSize(received)} / ${formatSize(total)})`;
         }
         
-        // 发送文件
+        // 发送文件（HTTP 流式分片上传，支持大文件）
         async function sendFile(file) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 showToast('未连接到服务器', 'error');
@@ -2144,92 +2080,79 @@
             
             // 显示文件信息
             fileName.textContent = file.name;
-            const formatSize = (bytes) => {
-                if (bytes < 1024) return bytes + ' B';
-                if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-                return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-            };
             fileSize.textContent = formatSize(file.size);
             progressFill.style.width = '0%';
             progressText.textContent = '0% (0 / ' + formatSize(file.size) + ')';
+            fileTransferOverlay.classList.remove('hidden');
             
-            currentFileTransfer = {
-                name: file.name,
-                size: file.size,
-                type: file.type
-            };
-            
-            // 发送文件开始消息
-            ws.send(JSON.stringify({
-                type: 'file_start',
-                name: file.name,
-                size: file.size,
-                mime_type: file.type
-            }));
-            
-            // 等待服务端确认
-            const waitForAccept = () => new Promise((resolve, reject) => {
-                const handler = (event) => {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'file_accept') {
-                        ws.removeEventListener('message', handler);
-                        resolve(data.file_id);
-                    } else if (data.type === 'file_error') {
-                        ws.removeEventListener('message', handler);
-                        reject(data.error);
-                    }
-                };
-                ws.addEventListener('message', handler);
-                setTimeout(() => {
-                    ws.removeEventListener('message', handler);
-                    reject('等待确认超时');
-                }, 10000);
-            });
+            let fileId = null;
+            currentFileTransfer = { name: file.name, size: file.size, cancelled: false };
             
             try {
-                const fileId = await waitForAccept();
-                currentFileTransfer.fileId = fileId;
+                // 1. 初始化上传
+                const initRes = await fetch(`/upload/init?login_id=${encodeURIComponent(currentLoginId)}&name=${encodeURIComponent(file.name)}&size=${file.size}&mime=${encodeURIComponent(file.type || 'application/octet-stream')}`, {
+                    method: 'POST'
+                });
+                if (!initRes.ok) {
+                    const errData = await initRes.json().catch(() => ({}));
+                    throw new Error(errData.error || '初始化上传失败');
+                }
+                const initData = await initRes.json();
+                fileId = initData.fileId;
+                const chunkSize = initData.chunkSize || (1024 * 1024);
                 
-                // 分片读取并发送
-                const chunkSize = 64 * 1024; // 64KB
+                // 2. 分片上传（顺序发送，内存中只保留当前分片）
                 const totalChunks = Math.ceil(file.size / chunkSize);
-                
                 for (let i = 0; i < totalChunks; i++) {
-                    if (!currentFileTransfer) break; // 被取消
+                    if (!currentFileTransfer || currentFileTransfer.cancelled) {
+                        throw new Error('已取消');
+                    }
                     
                     const start = i * chunkSize;
                     const end = Math.min(start + chunkSize, file.size);
                     const chunk = file.slice(start, end);
                     
-                    const arrayBuffer = await chunk.arrayBuffer();
-                    const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+                    const chunkRes = await fetch(`/upload/chunk/${fileId}/${i}`, {
+                        method: 'POST',
+                        body: chunk
+                    });
+                    if (!chunkRes.ok) {
+                        const errData = await chunkRes.json().catch(() => ({}));
+                        throw new Error(errData.error || `分片 ${i + 1}/${totalChunks} 上传失败`);
+                    }
                     
-                    ws.send(JSON.stringify({
-                        type: 'file_chunk',
-                        file_id: fileId,
-                        index: i,
-                        data: base64,
-                        is_last: i === totalChunks - 1
-                    }));
-                    
-                    // 更新进度（估算）
                     updateFileProgress(end, file.size);
                     
-                    // 小延迟避免阻塞
-                    await new Promise(r => setTimeout(r, 10));
+                    // 微小延迟，避免浏览器并发阻塞
+                    await new Promise(r => setTimeout(r, 5));
                 }
                 
-                // 发送完成
-                if (currentFileTransfer) {
-                    ws.send(JSON.stringify({
-                        type: 'file_end',
-                        file_id: fileId
-                    }));
+                if (!currentFileTransfer || currentFileTransfer.cancelled) {
+                    throw new Error('已取消');
                 }
+                
+                // 3. 完成上传
+                const completeRes = await fetch(`/upload/complete/${fileId}`, {
+                    method: 'POST'
+                });
+                if (!completeRes.ok) {
+                    const errData = await completeRes.json().catch(() => ({}));
+                    throw new Error(errData.error || '完成上传失败');
+                }
+                
+                hideFileProgress();
+                showToast(`文件已发送: ${file.name}`, 'success');
                 
             } catch (error) {
+                if (fileId && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'file_cancel', file_id: fileId }));
+                }
                 hideFileProgress();
-                showToast('文件传输失败: ' + error, 'error');
+                if (error.message === '已取消') {
+                    showToast('已取消传输', 'warning');
+                } else {
+                    showToast('文件传输失败: ' + error.message, 'error');
+                }
             }
         }
         

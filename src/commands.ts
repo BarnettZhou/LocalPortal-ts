@@ -287,6 +287,7 @@ export class CommandHandler {
     if (this.app) {
       this.app.linkedDeviceName = device.deviceName;
       this.app.linkedLoginId = device.loginId;
+      this.app.updatePrompt();
     }
     return `${_('[OK] Entered device session mode')}: ${device.deviceName} (${device.loginId})\n${_('Hint: type directly to send, /unlink to exit')}`;
   }
@@ -296,6 +297,7 @@ export class CommandHandler {
       const oldName = this.app.linkedDeviceName;
       this.app.linkedDeviceName = '';
       this.app.linkedLoginId = '';
+      this.app.updatePrompt();
       if (oldName) return _('[OK] Exited session mode with {name}', { name: oldName });
     }
     return _('[!] Not in any device session mode');

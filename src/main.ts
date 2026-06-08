@@ -31,11 +31,21 @@ export class PortalApp {
   running = true;
   linkedDeviceName = '';
   linkedLoginId = '';
+  rl?: readline.Interface;
 
   constructor(config: ServerConfig) {
     this.config = config;
     this.server = new Server(config);
     this.cmdHandler = new CommandHandler(config, this.server, this);
+  }
+
+  updatePrompt(): void {
+    if (!this.rl) return;
+    if (this.linkedDeviceName) {
+      this.rl.setPrompt(`lportal[${this.linkedDeviceName}]> `);
+    } else {
+      this.rl.setPrompt('lportal> ');
+    }
   }
 
   async run(): Promise<void> {
@@ -64,6 +74,7 @@ export class PortalApp {
       output: process.stdout,
       prompt: 'lportal> ',
     });
+    this.rl = rl;
 
     setActiveReadline(rl);
 

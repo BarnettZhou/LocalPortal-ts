@@ -3,6 +3,7 @@
 import readline from 'node:readline';
 import process from 'node:process';
 import net from 'node:net';
+import { Transform } from 'node:stream';
 import { CommandHandler, SystemExit } from './commands.js';
 import { ServerConfig, validatePairingCode } from './config.js';
 import { setLocale, _ } from './i18n.js';
@@ -32,6 +33,8 @@ export class PortalApp {
   linkedDeviceName = '';
   linkedLoginId = '';
   rl?: readline.Interface;
+  private pendingPasteText: string | null = null;
+  private pendingPasteLineCount = 0;
 
   constructor(config: ServerConfig) {
     this.config = config;
@@ -69,8 +72,55 @@ export class PortalApp {
 
     this.processTerminalMessages();
 
-    const rl = readline.createInterface({
-      input: process.stdin,
+    // 声明 rl 变量供 keypress handler 提前引用
+    let rl: readline.Interface;
+
+    // 必须先启用 keypress 事件，这样我们的监听器才能在 readline 之前注册
+    readline.emitKeypressEvents(process.stdin);
+
+    // 拦截 Backspace：若当前行是 paste 占位符，则一次性清空整行
+    process.stdin.on('keypress', (_str, key) => {
+      if (key.name === 'backspace' && this.pendingPasteText !== null) {
+        const placeholder = `[pasted ${this.pendingPasteLineCount} lines]`;
+        // readline 的 backspace 处理会在之后执行；如果 cursor 已经是 0 且 line 为空，
+        // readline 不会做任何事，因此显示保持我们刷新后的空行。
+        if (rl.line === placeholder) {
+          (rl as any).line = '';
+          (rl as any).cursor = 0;
+          (rl as any)._refreshLine();
+          this.pendingPasteText = null;
+          this.pendingPasteLineCount = 0;
+        }
+      }
+    });
+
+    // 自定义 Transform：把多行粘贴内容替换成占位符
+    const self = this;
+    const interceptor = new Transform({
+      transform(chunk, _encoding, callback) {
+        const text = chunk.toString();
+
+        // 检测到包含换行符且长度 > 1 的输入块，视为粘贴
+        if ((text.includes('\n') || text.includes('\r')) && text.length > 1) {
+          const rawText = text.replace(/\r?\n$/, '');
+          const lineCount = rawText.split(/\r?\n/).filter((l: string) => l.length > 0).length;
+
+          if (lineCount > 1) {
+            self.pendingPasteText = rawText;
+            self.pendingPasteLineCount = lineCount;
+            callback(null, Buffer.from(`[pasted ${lineCount} lines]`));
+            return;
+          }
+        }
+
+        callback(null, chunk);
+      },
+    });
+
+    process.stdin.pipe(interceptor);
+
+    rl = readline.createInterface({
+      input: interceptor,
       output: process.stdout,
       prompt: 'lportal> ',
     });
@@ -81,8 +131,16 @@ export class PortalApp {
     rl.prompt();
 
     return new Promise<void>((resolve) => {
-      rl.on('line', async (line) => {
-        const cmd = line.trim();
+      rl.on('line', async (displayLine) => {
+        let cmd = displayLine.trim();
+
+        // 若刚才粘贴了多行文本，用实际内容替换占位符
+        if (this.pendingPasteText !== null) {
+          cmd = this.pendingPasteText;
+          this.pendingPasteText = null;
+          this.pendingPasteLineCount = 0;
+        }
+
         if (!cmd) {
           rl.prompt();
           return;

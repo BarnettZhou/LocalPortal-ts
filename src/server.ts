@@ -2,12 +2,14 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
 import clipboardy from 'clipboardy';
 import type { ServerConfig } from './config.js';
 import type { MessageEntry } from './history.js';
+import type { PortalApp } from './main.js';
 import { _ } from './i18n.js';
 import { generateQrPng, generateQrHtml } from './qr.js';
 import { getFileTransferManager, FileTransferManager } from './file-transfer.js';
@@ -63,6 +65,37 @@ export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+function isLocalhost(req: http.IncomingMessage): boolean {
+  const addr = req.socket.remoteAddress;
+  if (!addr) return false;
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+function sendJson(res: http.ServerResponse, status: number, data: unknown): void {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(data));
+}
+
+function sendError(res: http.ServerResponse, status: number, message: string): void {
+  sendJson(res, status, { error: message });
+}
+
+function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf-8');
+        resolve(JSON.parse(text || '{}'));
+      } catch {
+        resolve({});
+      }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
 export interface TerminalMessage {
   type: 'new_message' | 'clipboard_error' | 'file_received' | 'server_message_sent';
   entry?: MessageEntry;
@@ -85,6 +118,7 @@ export class Server {
   private httpServer: http.Server | null = null;
   private wss: WebSocketServer | null = null;
   terminalQueue = new AsyncQueue<TerminalMessage | null>();
+  portalApp?: PortalApp;
 
   verifiedClients: Set<WebSocket> = new Set();
   devices: Map<string, DeviceInfo> = new Map(); // loginId -> DeviceInfo
@@ -111,19 +145,43 @@ export class Server {
   async start(): Promise<number> {
     this.httpServer = http.createServer((req, res) => {
       const url = new URL(req.url || '/', `http://${req.headers.host}`);
-      if (url.pathname === '/') {
+      const pathname = url.pathname;
+
+      // /web 及 /api/* 仅限本机访问
+      if ((pathname === '/web' || pathname.startsWith('/api/')) && !isLocalhost(req)) {
+        sendError(res, 403, _('Forbidden: local access only'));
+        return;
+      }
+
+      if (pathname === '/') {
         this.handleIndex(req, res);
-      } else if (url.pathname === '/qr') {
+      } else if (pathname === '/web') {
+        this.handleWeb(req, res);
+      } else if (pathname === '/api/devices') {
+        this.handleApiDevices(req, res);
+      } else if (pathname === '/api/link-status') {
+        this.handleApiLinkStatus(req, res);
+      } else if (pathname === '/api/link') {
+        this.handleApiLink(req, res);
+      } else if (pathname === '/api/unlink') {
+        this.handleApiUnlink(req, res);
+      } else if (pathname === '/api/history') {
+        this.handleApiHistory(req, res);
+      } else if (pathname === '/api/send-text') {
+        this.handleApiSendText(req, res);
+      } else if (pathname === '/api/send-file') {
+        this.handleApiSendFile(req, res);
+      } else if (pathname === '/qr') {
         this.handleQrPage(req, res);
-      } else if (url.pathname === '/qr.png') {
+      } else if (pathname === '/qr.png') {
         this.handleQrImage(req, res);
-      } else if (url.pathname === '/upload/init') {
+      } else if (pathname === '/upload/init') {
         this.handleUploadInit(req, res);
-      } else if (url.pathname.startsWith('/upload/chunk/')) {
+      } else if (pathname.startsWith('/upload/chunk/')) {
         this.handleUploadChunk(req, res);
-      } else if (url.pathname.startsWith('/upload/complete/')) {
+      } else if (pathname.startsWith('/upload/complete/')) {
         this.handleUploadComplete(req, res);
-      } else if (url.pathname.startsWith('/files/')) {
+      } else if (pathname.startsWith('/files/')) {
         this.handleFileDownload(req, res);
       } else {
         res.writeHead(404);
@@ -189,6 +247,8 @@ export class Server {
     }
 
     return new Promise((resolve) => {
+      // 强制关闭仍保持的 HTTP 连接，避免 /exit 因浏览器长连接而卡住
+      try { (this.httpServer as any).closeAllConnections?.(); } catch {}
       this.wss?.close(() => {
         this.httpServer?.close(() => {
           resolve();
@@ -223,6 +283,202 @@ export class Server {
       res.writeHead(500);
       res.end('QR generation failed');
     }
+  }
+
+  // ==================== 本地网页控制台 /web ====================
+
+  private handleWeb(_req: http.IncomingMessage, res: http.ServerResponse) {
+    const webFile = this.findStaticFile('web.html');
+    if (webFile) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      fs.createReadStream(webFile).pipe(res);
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(_('web.html not found'));
+    }
+  }
+
+  private handleApiDevices(_req: http.IncomingMessage, res: http.ServerResponse) {
+    const onlineDevices = Array.from(this.devices.values())
+      .filter(info => info.ws && info.ws.readyState === WebSocket.OPEN)
+      .map(info => ({
+        deviceName: info.deviceName,
+        loginId: info.loginId,
+        loginTime: info.loginTime.toISOString(),
+      }));
+    sendJson(res, 200, { devices: onlineDevices });
+  }
+
+  private handleApiLinkStatus(_req: http.IncomingMessage, res: http.ServerResponse) {
+    const app = this.portalApp;
+    sendJson(res, 200, {
+      linked: !!(app && app.linkedLoginId),
+      deviceName: app?.linkedDeviceName || '',
+      loginId: app?.linkedLoginId || '',
+    });
+  }
+
+  private async handleApiLink(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method !== 'POST') {
+      sendError(res, 405, _('Method not allowed'));
+      return;
+    }
+    const body = await readJsonBody(req);
+    const target = String(body.target || '').trim();
+    if (!target) {
+      sendError(res, 400, _('Missing target device'));
+      return;
+    }
+    let device = this.devices.get(target);
+    if (!device) {
+      for (const info of this.devices.values()) {
+        if (info.deviceName === target && info.ws && info.ws.readyState === WebSocket.OPEN) {
+          device = info;
+          break;
+        }
+      }
+    }
+    if (!device || !device.ws || device.ws.readyState !== WebSocket.OPEN) {
+      sendError(res, 404, _('Online device not found'));
+      return;
+    }
+    if (this.portalApp) {
+      this.portalApp.linkedDeviceName = device.deviceName;
+      this.portalApp.linkedLoginId = device.loginId;
+      this.portalApp.updatePrompt();
+    }
+    sendJson(res, 200, { success: true, deviceName: device.deviceName, loginId: device.loginId });
+  }
+
+  private async handleApiUnlink(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method !== 'POST') {
+      sendError(res, 405, _('Method not allowed'));
+      return;
+    }
+    if (this.portalApp) {
+      this.portalApp.linkedDeviceName = '';
+      this.portalApp.linkedLoginId = '';
+      this.portalApp.updatePrompt();
+    }
+    sendJson(res, 200, { success: true });
+  }
+
+  private handleApiHistory(req: http.IncomingMessage, res: http.ServerResponse) {
+    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    const loginId = url.searchParams.get('login_id') || '';
+    if (!loginId) {
+      sendError(res, 400, _('Missing login_id'));
+      return;
+    }
+    const entries = this.config.history.list()
+      .filter(e => e.loginId === loginId || e.targetLoginId === loginId)
+      .reverse()
+      .map(e => ({
+        id: e.id,
+        text: e.text,
+        preview: e.preview,
+        time: e.time.toISOString(),
+        session_id: e.sessionId,
+        device_name: e.deviceName,
+        login_id: e.loginId,
+        target_login_id: e.targetLoginId,
+        file_id: e.fileId,
+        file_name: e.fileName,
+        file_size: e.fileSize,
+        mime_type: e.mimeType,
+      }));
+    sendJson(res, 200, { history: entries });
+  }
+
+  private async handleApiSendText(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method !== 'POST') {
+      sendError(res, 405, _('Method not allowed'));
+      return;
+    }
+    const body = await readJsonBody(req);
+    const content = String(body.content || '').trim();
+    if (!content) {
+      sendError(res, 400, _('Message content is empty'));
+      return;
+    }
+    const app = this.portalApp;
+    if (!app || !app.linkedLoginId) {
+      sendError(res, 400, _('Not linked to any device'));
+      return;
+    }
+    try {
+      const entry = await this.sendServerText(content, app.linkedLoginId);
+      if (!entry) {
+        sendError(res, 502, _('Failed to send, device may be offline'));
+        return;
+      }
+      sendJson(res, 200, {
+        success: true,
+        id: entry.id,
+        text: entry.text,
+        preview: entry.preview,
+        time: entry.time.toISOString(),
+        session_id: entry.sessionId,
+      });
+    } catch (e: any) {
+      sendError(res, 500, e.message || _('Send failed'));
+    }
+  }
+
+  private handleApiSendFile(req: http.IncomingMessage, res: http.ServerResponse) {
+    if (req.method !== 'POST') {
+      sendError(res, 405, _('Method not allowed'));
+      return;
+    }
+    const url = new URL(req.url || '/', `http://${req.headers.host}`);
+    const loginId = url.searchParams.get('login_id') || '';
+    const name = decodeURIComponent(url.searchParams.get('name') || '');
+    const mimeType = decodeURIComponent(url.searchParams.get('mime') || 'application/octet-stream');
+    const expectedSize = Number(url.searchParams.get('size') || 0);
+    if (!loginId || !name) {
+      sendError(res, 400, _('Missing file parameters'));
+      return;
+    }
+    const app = this.portalApp;
+    if (!app || app.linkedLoginId !== loginId) {
+      sendError(res, 400, _('Not linked to target device'));
+      return;
+    }
+    const tmpDir = path.join(os.tmpdir(), `lportal-web-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const safeName = path.basename(name) || 'file';
+    const tmpPath = path.join(tmpDir, safeName);
+    try {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    } catch (e: any) {
+      sendError(res, 500, e.message || _('Failed to receive file'));
+      return;
+    }
+    const writeStream = fs.createWriteStream(tmpPath);
+    req.pipe(writeStream);
+    writeStream.on('error', (err) => {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      sendError(res, 500, err.message || _('Failed to receive file'));
+    });
+    writeStream.on('finish', async () => {
+      try {
+        const stats = fs.statSync(tmpPath);
+        if (expectedSize > 0 && stats.size !== expectedSize) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          sendError(res, 400, _('File size mismatch'));
+          return;
+        }
+        const result = await this.sendServerFile(tmpPath, loginId);
+        if (!result) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+          sendError(res, 502, _('Failed to send, device may be offline'));
+          return;
+        }
+        sendJson(res, 200, { success: true, file_id: result.file_id, name, size: stats.size, mime_type: mimeType });
+      } catch (e: any) {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+        sendError(res, 500, e.message || _('Send failed'));
+      }
+    });
   }
 
   // ==================== HTTP 流式上传 ====================

@@ -33,6 +33,7 @@ export class PortalApp {
   linkedDeviceName = '';
   linkedLoginId = '';
   rl?: readline.Interface;
+  private inputInterceptor?: Transform;
   private pendingPasteText: string | null = null;
   private pendingPasteLineCount = 0;
 
@@ -118,6 +119,7 @@ export class PortalApp {
     });
 
     process.stdin.pipe(interceptor);
+    this.inputInterceptor = interceptor;
 
     rl = readline.createInterface({
       input: interceptor,
@@ -220,6 +222,12 @@ export class PortalApp {
     this.server.terminalQueue.put(null);
     this.running = false;
     await this.server.stop(true);
+    // 解除 stdin 管道并暂停输入，避免 /exit 后进程挂起
+    if (this.inputInterceptor) {
+      process.stdin.unpipe(this.inputInterceptor);
+      this.inputInterceptor.destroy();
+    }
+    process.stdin.pause();
     printMessage(_('Service closed'));
   }
 }
@@ -260,6 +268,7 @@ export async function main(options: RunOptions): Promise<void> {
   );
 
   const portal = new PortalApp(config);
+  portal.server.portalApp = portal;
   try {
     await portal.run();
   } catch {

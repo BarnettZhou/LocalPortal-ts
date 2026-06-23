@@ -60,6 +60,7 @@ export class CommandHandler {
       case '/link': return await this._handleLink(args);
       case '/unlink': return this._handleUnlink();
       case '/send': return await this._handleSend(args);
+      case '/web': return this._handleWeb();
       default:
         return `${_('[?] Unknown command')}: ${cmd}, ${_('type /help for available commands')}`;
     }
@@ -338,6 +339,11 @@ export class CommandHandler {
       }
     }
     return results.join('\n');
+  }
+
+  private _handleWeb(): string {
+    openBrowser(`${this.config.localUrl}/web`);
+    return `${_('[OK] Opened local web console in browser')} ${this.config.localUrl}/web`;
   }
 }
 

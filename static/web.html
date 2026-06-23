@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Local Portal - 本地控制台</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #f97316;
+            --primary-dark: #ea580c;
+            --primary-soft: rgba(249, 115, 22, 0.15);
+            --bg: #0f0f0f;
+            --surface: #1a1a1a;
+            --surface-hover: #252525;
+            --text: #f5f5f5;
+            --text-secondary: #a3a3a3;
+            --border: #262626;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --error: #ef4444;
+        }
+
+        html, body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #050505;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .app-container {
+            position: relative;
+            width: 100%;
+            height: 100dvh;
+            max-width: 100%;
+            background: var(--bg);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+
+        @media (min-width: 850px) {
+            .app-container {
+                width: 820px;
+                height: 90dvh;
+                max-height: 1024px;
+                border-radius: 24px;
+                border: 1px solid var(--border);
+                box-shadow: 0 0 80px rgba(0, 0, 0, 0.6), 0 24px 80px rgba(0, 0, 0, 0.4);
+            }
+        }
+
+        .view {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg);
+            transition: opacity 0.2s ease;
+        }
+
+        .view.hidden {
+            display: none;
+        }
+
+        /* 顶部工具栏 */
+        .toolbar {
+            flex-shrink: 0;
+            padding: 14px 16px;
+            padding-top: max(14px, env(safe-area-inset-top));
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            z-index: 10;
+        }
+
+        .toolbar-btn {
+            width: 38px;
+            height: 38px;
+            border: none;
+            border-radius: 10px;
+            background: var(--bg);
+            color: var(--text);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            border: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .toolbar-btn:hover {
+            background: var(--surface-hover);
+        }
+
+        .toolbar-btn:active {
+            transform: scale(0.95);
+        }
+
+        .toolbar-title {
+            flex: 1;
+            font-size: 17px;
+            font-weight: 600;
+            text-align: center;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .toolbar-spacer {
+            width: 38px;
+            flex-shrink: 0;
+        }
+
+        /* 设备列表 */
+        .devices-scroll {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        .section-title {
+            font-size: 13px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+
+        .device-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 12px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            transition: all 0.2s;
+        }
+
+        .device-card:hover {
+            background: var(--surface-hover);
+            border-color: var(--primary);
+        }
+
+        .device-card:active {
+            transform: scale(0.99);
+        }
+
+        .device-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 14px;
+            background: var(--primary-soft);
+            color: var(--primary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            flex-shrink: 0;
+        }
+
+        .device-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .device-name {
+            font-size: 16px;
+            font-weight: 500;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .device-id {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: monospace;
+        }
+
+        .device-arrow {
+            color: var(--text-secondary);
+        }
+
+        /* 空状态 */
+        .empty-state {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            color: var(--text-secondary);
+            text-align: center;
+        }
+
+        .empty-icon {
+            font-size: 56px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .empty-text {
+            font-size: 15px;
+            margin-bottom: 6px;
+        }
+
+        .empty-hint {
+            font-size: 13px;
+            opacity: 0.7;
+        }
+
+        /* 消息区域 */
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+            padding-bottom: calc(12px + env(safe-area-inset-bottom));
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .message {
+            max-width: 76%;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .message-in {
+            align-self: flex-start;
+        }
+
+        .message-out {
+            align-self: flex-end;
+        }
+
+        .message-bubble {
+            padding: 12px 14px;
+            border-radius: 18px;
+            font-size: 15px;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+
+        .message-in .message-bubble {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-bottom-left-radius: 6px;
+            color: var(--text);
+        }
+
+        .message-out .message-bubble {
+            background: var(--primary);
+            border-bottom-right-radius: 6px;
+            color: white;
+        }
+
+        .message-media {
+            max-width: 100%;
+            border-radius: 12px;
+            display: block;
+            cursor: pointer;
+        }
+
+        .message-video {
+            max-width: 100%;
+            border-radius: 12px;
+            display: block;
+        }
+
+        .message-file {
+            text-decoration: none;
+            color: inherit;
+            display: block;
+        }
+
+        .message-file-card {
+            background: rgba(255, 255, 255, 0.08);
+            padding: 10px 12px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .message-file-icon {
+            font-size: 22px;
+        }
+
+        .message-file-meta {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .message-file-name {
+            font-size: 14px;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .message-file-action {
+            font-size: 12px;
+            opacity: 0.8;
+            margin-top: 2px;
+        }
+
+        .message-meta {
+            font-size: 11px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0 4px;
+        }
+
+        .message-out .message-meta {
+            justify-content: flex-end;
+        }
+
+        .message-sender {
+            color: var(--primary);
+        }
+
+        /* 底部输入 */
+        .input-area {
+            flex-shrink: 0;
+            background: var(--surface);
+            border-top: 1px solid var(--border);
+            padding: 12px 14px;
+            padding-bottom: max(12px, env(safe-area-inset-bottom));
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+
+        .attach-btn {
+            width: 44px;
+            height: 44px;
+            border: none;
+            border-radius: 12px;
+            background: var(--bg);
+            color: var(--text-secondary);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .attach-btn:hover {
+            background: var(--surface-hover);
+            color: var(--text);
+        }
+
+        .attach-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .message-input {
+            flex: 1;
+            min-height: 44px;
+            max-height: 160px;
+            padding: 10px 14px;
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 15px;
+            line-height: 1.4;
+            resize: none;
+            outline: none;
+            font-family: inherit;
+        }
+
+        .message-input:focus {
+            border-color: var(--primary);
+        }
+
+        .send-btn {
+            width: 44px;
+            height: 44px;
+            border: none;
+            border-radius: 12px;
+            background: var(--primary);
+            color: white;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+
+        .send-btn:hover {
+            background: var(--primary-dark);
+        }
+
+        .send-btn:active {
+            transform: scale(0.95);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* 文件传输进度 */
+        .transfer-toast {
+            position: absolute;
+            bottom: 90px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 14px 16px;
+            width: min(90%, 360px);
+            z-index: 100;
+            display: none;
+        }
+
+        .transfer-toast.active {
+            display: block;
+        }
+
+        .transfer-name {
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .progress-bar {
+            height: 6px;
+            background: var(--border);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: var(--primary);
+            border-radius: 3px;
+            width: 0%;
+            transition: width 0.2s;
+        }
+
+        .transfer-meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 8px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* Toast */
+        .toast {
+            position: absolute;
+            top: 70px;
+            left: 50%;
+            transform: translateX(-50%) translateY(-20px);
+            background: var(--surface);
+            color: var(--text);
+            padding: 10px 18px;
+            border-radius: 8px;
+            font-size: 14px;
+            z-index: 200;
+            opacity: 0;
+            transition: all 0.25s ease;
+            border: 1px solid var(--border);
+            pointer-events: none;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        .toast.error {
+            border-color: var(--error);
+        }
+
+        /* 粘贴文件确认弹窗 */
+        .paste-modal-overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 300;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            visibility: hidden;
+            transition: all 0.2s ease;
+        }
+
+        .paste-modal-overlay.active {
+            opacity: 1;
+            visibility: visible;
+        }
+
+        .paste-modal {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            width: min(90%, 360px);
+            padding: 20px;
+        }
+
+        .paste-modal-title {
+            font-size: 17px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .paste-modal-sub {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+        }
+
+        .paste-preview {
+            width: 100%;
+            max-height: 220px;
+            object-fit: contain;
+            border-radius: 12px;
+            margin-bottom: 16px;
+            background: var(--bg);
+        }
+
+        .paste-file-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: var(--bg);
+            padding: 12px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+        }
+
+        .paste-file-icon {
+            font-size: 24px;
+            flex-shrink: 0;
+        }
+
+        .paste-file-name {
+            font-size: 14px;
+            font-weight: 500;
+            word-break: break-word;
+        }
+
+        .paste-file-size {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .paste-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .paste-actions button {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 12px;
+            font-size: 15px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .paste-cancel {
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .paste-cancel:hover {
+            background: var(--surface-hover);
+        }
+
+        .paste-confirm {
+            background: var(--primary);
+            color: white;
+        }
+
+        .paste-confirm:hover {
+            background: var(--primary-dark);
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- 设备列表视图 -->
+        <div class="view" id="devicesView">
+            <div class="toolbar">
+                <div class="toolbar-spacer"></div>
+                <div class="toolbar-title">远端设备</div>
+                <div class="toolbar-spacer"></div>
+            </div>
+            <div class="devices-scroll" id="devicesList">
+                <div class="empty-state" id="devicesEmpty">
+                    <div class="empty-icon">📡</div>
+                    <div class="empty-text">暂无在线设备</div>
+                    <div class="empty-hint">请先在手机端扫描二维码连接</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 聊天视图 -->
+        <div class="view hidden" id="chatView">
+            <div class="toolbar">
+                <button class="toolbar-btn" id="backBtn" title="退出连接">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M19 12H5M12 19l-7-7 7-7"/>
+                    </svg>
+                </button>
+                <div class="toolbar-title" id="chatTitle">未连接</div>
+                <div class="toolbar-spacer"></div>
+            </div>
+            <div class="messages-container" id="messagesContainer"></div>
+            <div class="transfer-toast" id="transferToast">
+                <div class="transfer-name" id="transferName">file.jpg</div>
+                <div class="progress-bar"><div class="progress-fill" id="transferFill"></div></div>
+                <div class="transfer-meta">
+                    <span id="transferPercent">0%</span>
+                    <span id="transferSize">0 / 0</span>
+                </div>
+            </div>
+            <div class="input-area">
+                <input type="file" id="fileInput" style="display: none;">
+                <button class="attach-btn" id="attachBtn" title="发送文件">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                    </svg>
+                </button>
+                <textarea class="message-input" id="messageInput" rows="1" placeholder="输入消息..."></textarea>
+                <button class="send-btn" id="sendBtn" title="发送">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        <!-- 粘贴文件确认弹窗 -->
+        <div class="paste-modal-overlay" id="pasteModal">
+            <div class="paste-modal">
+                <div class="paste-modal-title">发送文件/图片</div>
+                <div class="paste-modal-sub">检测到粘贴内容包含文件，是否发送？</div>
+                <div id="pastePreview"></div>
+                <div class="paste-file-info" id="pasteFileInfo">
+                    <div class="paste-file-icon" id="pasteFileIcon">📎</div>
+                    <div>
+                        <div class="paste-file-name" id="pasteFileName"></div>
+                        <div class="paste-file-size" id="pasteFileSize"></div>
+                    </div>
+                </div>
+                <div class="paste-actions">
+                    <button class="paste-cancel" id="pasteCancel">取消</button>
+                    <button class="paste-confirm" id="pasteConfirm">确认发送</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="toast" id="toast"></div>
+    </div>
+
+    <script>
+        // 状态
+        let linkedLoginId = '';
+        let linkedDeviceName = '';
+        let messages = [];
+        let pollDevicesTimer = null;
+        let pollHistoryTimer = null;
+        let pollStatusTimer = null;
+        let lastHistoryJson = '';
+
+        // DOM
+        const devicesView = document.getElementById('devicesView');
+        const chatView = document.getElementById('chatView');
+        const devicesList = document.getElementById('devicesList');
+        const devicesEmpty = document.getElementById('devicesEmpty');
+        const chatTitle = document.getElementById('chatTitle');
+        const messagesContainer = document.getElementById('messagesContainer');
+        const messageInput = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const attachBtn = document.getElementById('attachBtn');
+        const fileInput = document.getElementById('fileInput');
+        const backBtn = document.getElementById('backBtn');
+        const toast = document.getElementById('toast');
+        const transferToast = document.getElementById('transferToast');
+        const transferName = document.getElementById('transferName');
+        const transferFill = document.getElementById('transferFill');
+        const transferPercent = document.getElementById('transferPercent');
+        const transferSize = document.getElementById('transferSize');
+        const pasteModal = document.getElementById('pasteModal');
+        const pastePreview = document.getElementById('pastePreview');
+        const pasteFileInfo = document.getElementById('pasteFileInfo');
+        const pasteFileIcon = document.getElementById('pasteFileIcon');
+        const pasteFileName = document.getElementById('pasteFileName');
+        const pasteFileSize = document.getElementById('pasteFileSize');
+        const pasteCancel = document.getElementById('pasteCancel');
+        const pasteConfirm = document.getElementById('pasteConfirm');
+        let pendingPasteFile = null;
+        let pendingPasteObjectUrl = null;
+
+        function showToast(text, type = '') {
+            toast.textContent = text;
+            toast.className = 'toast show' + (type ? ' ' + type : '');
+            setTimeout(() => toast.classList.remove('show'), 2500);
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+            return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+        }
+
+        function formatTime(iso) {
+            const d = new Date(iso);
+            return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+        }
+
+        function messageSignature(msg) {
+            return `${msg.time}|${msg.login_id}|${msg.text}|${msg.file_id || ''}`;
+        }
+
+        // 视图切换
+        function showDevices() {
+            chatView.classList.add('hidden');
+            devicesView.classList.remove('hidden');
+            stopChatPolling();
+            startDevicesPolling();
+        }
+
+        function showChat(loginId, deviceName) {
+            linkedLoginId = loginId;
+            linkedDeviceName = deviceName;
+            chatTitle.textContent = deviceName;
+            devicesView.classList.add('hidden');
+            chatView.classList.remove('hidden');
+            messages = [];
+            lastHistoryJson = '';
+            messagesContainer.innerHTML = '';
+            stopDevicesPolling();
+            loadHistory();
+            startChatPolling();
+            messageInput.focus();
+        }
+
+        // 设备列表
+        async function loadDevices() {
+            try {
+                const res = await fetch('/api/devices');
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+                renderDevices(data.devices || []);
+            } catch {
+                renderDevices([]);
+            }
+        }
+
+        function renderDevices(devices) {
+            devicesList.innerHTML = '';
+            if (!devices.length) {
+                devicesList.appendChild(devicesEmpty);
+                devicesEmpty.style.display = 'flex';
+                return;
+            }
+            devicesEmpty.style.display = 'none';
+            const title = document.createElement('div');
+            title.className = 'section-title';
+            title.textContent = '选择要连接的设备';
+            devicesList.appendChild(title);
+            devices.forEach(dev => {
+                const card = document.createElement('div');
+                card.className = 'device-card';
+                card.innerHTML = `
+                    <div class="device-icon">📱</div>
+                    <div class="device-info">
+                        <div class="device-name">${escapeHtml(dev.deviceName)}</div>
+                        <div class="device-id">${escapeHtml(dev.loginId)}</div>
+                    </div>
+                    <div class="device-arrow">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M9 18l6-6-6-6"/>
+                        </svg>
+                    </div>
+                `;
+                card.addEventListener('click', () => linkDevice(dev.loginId, dev.deviceName));
+                devicesList.appendChild(card);
+            });
+        }
+
+        async function linkDevice(loginId, deviceName) {
+            try {
+                const res = await fetch('/api/link', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ target: loginId })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.success) {
+                    showToast(data.error || '连接失败', 'error');
+                    return;
+                }
+                showChat(data.loginId, data.deviceName);
+            } catch (e) {
+                showToast('连接失败', 'error');
+            }
+        }
+
+        async function unlinkDevice() {
+            try {
+                await fetch('/api/unlink', { method: 'POST' });
+            } catch {}
+            showDevices();
+        }
+
+        // 历史消息
+        async function loadHistory() {
+            if (!linkedLoginId) return;
+            try {
+                const res = await fetch(`/api/history?login_id=${encodeURIComponent(linkedLoginId)}`);
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+                const history = data.history || [];
+                const json = JSON.stringify(history);
+                if (json === lastHistoryJson) return;
+                lastHistoryJson = json;
+                messages = history;
+                renderMessages();
+            } catch {
+                // ignore
+            }
+        }
+
+        function renderMessages() {
+            const existing = new Set(Array.from(messagesContainer.children).map(el => el.dataset.sig));
+            messages.forEach(msg => {
+                const sig = messageSignature(msg);
+                if (existing.has(sig)) return;
+                const el = createMessageElement(msg, sig);
+                messagesContainer.appendChild(el);
+            });
+            pruneExtraMessages();
+            scrollToBottom();
+        }
+
+        function pruneExtraMessages() {
+            const sigs = new Set(messages.map(messageSignature));
+            Array.from(messagesContainer.children).forEach(el => {
+                if (!sigs.has(el.dataset.sig)) el.remove();
+            });
+        }
+
+        function createMessageElement(msg, sig) {
+            const isOut = msg.login_id === 'server' || msg.target_login_id === linkedLoginId;
+            const el = document.createElement('div');
+            el.className = `message ${isOut ? 'message-out' : 'message-in'}`;
+            el.dataset.sig = sig;
+
+            const bubble = document.createElement('div');
+            bubble.className = 'message-bubble';
+
+            if (msg.file_id) {
+                const fileUrl = `/files/${msg.file_id}`;
+                if (msg.mime_type && msg.mime_type.startsWith('image/')) {
+                    bubble.innerHTML = `<img src="${fileUrl}" class="message-media" alt="图片" onclick="window.open(this.src)">`;
+                } else if (msg.mime_type && msg.mime_type.startsWith('video/')) {
+                    bubble.innerHTML = `<video src="${fileUrl}" class="message-video" controls></video>`;
+                } else {
+                    bubble.innerHTML = `
+                        <a href="${fileUrl}" download="${escapeHtml(msg.file_name || 'download')}" class="message-file">
+                            <div class="message-file-card">
+                                <span class="message-file-icon">📎</span>
+                                <div class="message-file-meta">
+                                    <div class="message-file-name">${escapeHtml(msg.file_name || msg.text)}</div>
+                                    <div class="message-file-action">点击下载 · ${formatSize(msg.file_size || 0)}</div>
+                                </div>
+                            </div>
+                        </a>
+                    `;
+                }
+            } else {
+                bubble.textContent = msg.text;
+            }
+
+            const meta = document.createElement('div');
+            meta.className = 'message-meta';
+            meta.innerHTML = `
+                <span class="message-sender">${escapeHtml(isOut ? '我' : (msg.device_name || '远端设备'))}</span>
+                <span>${formatTime(msg.time)}</span>
+            `;
+
+            el.appendChild(bubble);
+            el.appendChild(meta);
+            return el;
+        }
+
+        function scrollToBottom() {
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        // 发送文字
+        async function sendText() {
+            const text = messageInput.value.trim();
+            if (!text) return;
+            if (!linkedLoginId) {
+                showToast('未连接到设备', 'error');
+                return;
+            }
+            messageInput.value = '';
+            messageInput.style.height = '44px';
+            try {
+                const res = await fetch('/api/send-text', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: text })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.success) {
+                    showToast(data.error || '发送失败', 'error');
+                    return;
+                }
+                loadHistory();
+            } catch {
+                showToast('发送失败', 'error');
+            }
+        }
+
+        // 发送文件
+        function sendFile(file) {
+            if (!linkedLoginId) {
+                showToast('未连接到设备', 'error');
+                return;
+            }
+            transferName.textContent = file.name;
+            transferFill.style.width = '0%';
+            transferPercent.textContent = '0%';
+            transferSize.textContent = `0 / ${formatSize(file.size)}`;
+            transferToast.classList.add('active');
+            attachBtn.disabled = true;
+
+            const url = `/api/send-file?login_id=${encodeURIComponent(linkedLoginId)}&name=${encodeURIComponent(file.name)}&mime=${encodeURIComponent(file.type || 'application/octet-stream')}&size=${file.size}`;
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', url, true);
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    transferFill.style.width = percent + '%';
+                    transferPercent.textContent = percent + '%';
+                    transferSize.textContent = `${formatSize(e.loaded)} / ${formatSize(e.total)}`;
+                }
+            };
+            xhr.onload = () => {
+                transferToast.classList.remove('active');
+                attachBtn.disabled = false;
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    showToast('文件已发送');
+                    loadHistory();
+                } else {
+                    let err = '发送失败';
+                    try { err = JSON.parse(xhr.responseText).error || err; } catch {}
+                    showToast(err, 'error');
+                }
+            };
+            xhr.onerror = () => {
+                transferToast.classList.remove('active');
+                attachBtn.disabled = false;
+                showToast('发送失败', 'error');
+            };
+            xhr.send(file);
+        }
+
+        // 粘贴文件确认弹窗
+        function showPasteModal(file) {
+            pendingPasteFile = file;
+            pasteFileName.textContent = file.name;
+            pasteFileSize.textContent = formatSize(file.size);
+            pastePreview.innerHTML = '';
+
+            if (file.type && file.type.startsWith('image/')) {
+                pasteFileIcon.textContent = '🖼️';
+                pasteFileInfo.style.display = 'flex';
+                const img = document.createElement('img');
+                pendingPasteObjectUrl = URL.createObjectURL(file);
+                img.src = pendingPasteObjectUrl;
+                img.className = 'paste-preview';
+                img.alt = '预览';
+                pastePreview.appendChild(img);
+            } else if (file.type && file.type.startsWith('video/')) {
+                pasteFileIcon.textContent = '🎬';
+                pasteFileInfo.style.display = 'flex';
+                const video = document.createElement('video');
+                pendingPasteObjectUrl = URL.createObjectURL(file);
+                video.src = pendingPasteObjectUrl;
+                video.className = 'paste-preview';
+                video.controls = true;
+                pastePreview.appendChild(video);
+            } else {
+                pasteFileIcon.textContent = '📎';
+                pasteFileInfo.style.display = 'flex';
+            }
+
+            pasteModal.classList.add('active');
+        }
+
+        function hidePasteModal() {
+            pasteModal.classList.remove('active');
+            pendingPasteFile = null;
+            if (pendingPasteObjectUrl) {
+                URL.revokeObjectURL(pendingPasteObjectUrl);
+                pendingPasteObjectUrl = null;
+            }
+            setTimeout(() => {
+                pastePreview.innerHTML = '';
+                pasteFileName.textContent = '';
+                pasteFileSize.textContent = '';
+            }, 200);
+        }
+
+        function confirmPasteSend() {
+            if (pendingPasteFile) {
+                sendFile(pendingPasteFile);
+            }
+            hidePasteModal();
+        }
+
+        // 轮询控制
+        function startDevicesPolling() {
+            loadDevices();
+            if (pollDevicesTimer) clearInterval(pollDevicesTimer);
+            pollDevicesTimer = setInterval(loadDevices, 2000);
+        }
+
+        function stopDevicesPolling() {
+            if (pollDevicesTimer) {
+                clearInterval(pollDevicesTimer);
+                pollDevicesTimer = null;
+            }
+        }
+
+        function startChatPolling() {
+            if (pollHistoryTimer) clearInterval(pollHistoryTimer);
+            pollHistoryTimer = setInterval(loadHistory, 1000);
+            if (pollStatusTimer) clearInterval(pollStatusTimer);
+            pollStatusTimer = setInterval(checkLinkStatus, 3000);
+        }
+
+        function stopChatPolling() {
+            if (pollHistoryTimer) {
+                clearInterval(pollHistoryTimer);
+                pollHistoryTimer = null;
+            }
+            if (pollStatusTimer) {
+                clearInterval(pollStatusTimer);
+                pollStatusTimer = null;
+            }
+        }
+
+        async function checkLinkStatus() {
+            try {
+                const res = await fetch('/api/link-status');
+                const data = await res.json();
+                if (!data.linked) {
+                    showDevices();
+                }
+            } catch {}
+        }
+
+        // 初始化
+        async function init() {
+            try {
+                const res = await fetch('/api/link-status');
+                const data = await res.json();
+                if (data.linked && data.loginId) {
+                    showChat(data.loginId, data.deviceName || '远端设备');
+                    return;
+                }
+            } catch {}
+            showDevices();
+        }
+
+        // 事件绑定
+        sendBtn.addEventListener('click', sendText);
+        messageInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendText();
+            }
+        });
+        messageInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            const h = Math.max(44, Math.min(this.scrollHeight, 160));
+            this.style.height = h + 'px';
+        });
+        attachBtn.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', (e) => {
+            const files = e.target.files;
+            if (files && files[0]) sendFile(files[0]);
+            fileInput.value = '';
+        });
+        backBtn.addEventListener('click', unlinkDevice);
+
+        messageInput.addEventListener('paste', (e) => {
+            const files = e.clipboardData && e.clipboardData.files;
+            if (files && files.length > 0) {
+                e.preventDefault();
+                showPasteModal(files[0]);
+            }
+        });
+        pasteCancel.addEventListener('click', hidePasteModal);
+        pasteConfirm.addEventListener('click', confirmPasteSend);
+        pasteModal.addEventListener('click', (e) => {
+            if (e.target === pasteModal) hidePasteModal();
+        });
+
+        init();
+    </script>
+</body>
+</html>

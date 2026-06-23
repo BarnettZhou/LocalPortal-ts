@@ -281,6 +281,7 @@ export function printHelp(): string {
   printCmd('/list (/ls)', _('List last 10 message summaries'));
   printCmd('/status', _('Show service runtime status'));
   printCmd('/open', _('Open main page in browser'));
+  printCmd('/web', _('Open local web console'));
   printCmd('/qrcode (/qr)', _('Show QR code (scan to connect)'));
   printCmd('/downloads', _('Open download folder'));
 

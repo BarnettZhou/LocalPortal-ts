@@ -260,7 +260,12 @@ export class Server {
   private handleIndex(_req: http.IncomingMessage, res: http.ServerResponse) {
     const indexFile = this.findStaticFile('index.html');
     if (indexFile) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      });
       fs.createReadStream(indexFile).pipe(res);
     } else {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -270,7 +275,12 @@ export class Server {
 
   private handleQrPage(_req: http.IncomingMessage, res: http.ServerResponse) {
     const html = generateQrHtml(this.config.qrUrl);
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    });
     res.end(html);
   }
 
@@ -505,6 +515,7 @@ export class Server {
     const [fileId, error] = ftm.startTransfer(name, size, mimeType, loginId || undefined);
 
     if (fileId) {
+      console.log(`[upload] init ${fileId} name=${name} size=${size} mime=${mimeType} loginId=${loginId}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ fileId, chunkSize: FileTransferManager.CHUNK_SIZE }));
     } else {
@@ -559,20 +570,60 @@ export class Server {
     }
     const url = new URL(req.url || '/', `http://${req.headers.host}`);
     const parts = url.pathname.split('/');
-    const fileId = parts[3] || '';
+    const transferId = parts[3] || '';
 
     const ftm = getFileTransferManager();
-    const [savePath, error] = ftm.completeTransfer(fileId);
+    const fileInfo = ftm.activeTransfers.get(transferId);
+    const [savePath, error] = ftm.completeTransfer(transferId);
 
-    if (savePath) {
+    if (savePath && fileInfo) {
       const stats = fs.statSync(savePath);
       const fileName = path.basename(savePath);
+      console.log(`[upload] complete transfer=${transferId} saved=${fileName} size=${stats.size} uploader=${fileInfo.uploaderLoginId}`);
+
+      // 注册 HTTP 下载路径
+      const downloadFileId = Array.from({ length: 8 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+      this.fileRegistry.set(downloadFileId, savePath);
+
+      // 记录到历史，便于手机端和 web 控制台回放
+      const uploader = this.devices.get(fileInfo.uploaderLoginId || '');
+      const deviceName = uploader?.deviceName || '';
+      const loginId = fileInfo.uploaderLoginId || '';
+      const sessionId = this.config.currentSessionId;
+      this.config.history.add(
+        `[文件] ${fileName}`,
+        sessionId,
+        deviceName,
+        loginId,
+        '',
+        downloadFileId,
+        fileName,
+        stats.size,
+        fileInfo.mimeType
+      );
+
+      // 通知上传者（手机端），让它显示在聊天窗口里
+      if (uploader?.ws && uploader.ws.readyState === WebSocket.OPEN) {
+        uploader.ws.send(JSON.stringify({
+          type: 'server_file_ready',
+          file_id: downloadFileId,
+          name: fileName,
+          size: stats.size,
+          mime_type: fileInfo.mimeType,
+          download_url: `/files/${downloadFileId}`,
+          session_id: sessionId,
+          device_name: deviceName,
+          login_id: loginId,
+        }));
+      }
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, path: savePath, size: stats.size }));
+      res.end(JSON.stringify({ success: true, path: savePath, size: stats.size, file_id: downloadFileId }));
       this.terminalQueue.put({ type: 'file_received', path: savePath, name: fileName, size: stats.size });
     } else {
+      console.log(`[upload] complete failed transfer=${transferId} error=${error || 'unknown'}`);
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error }));
+      res.end(JSON.stringify({ error: error || '传输不存在或已过期' }));
     }
   }
 
@@ -1007,6 +1058,9 @@ export class Server {
       size: fileSize,
       mime_type: mimeType,
       download_url: `/files/${fileId}`,
+      session_id: sessionId,
+      device_name: _('Server'),
+      login_id: 'server',
     });
 
     return { file_id: fileId, name: fileName, size: fileSize, mime_type: mimeType };

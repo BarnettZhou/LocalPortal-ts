@@ -807,6 +807,21 @@
             flex: 1;
         }
 
+        .file-menu-label {
+            position: relative;
+            display: flex;
+        }
+
+        .file-menu-label input[type="file"] {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+        }
+
         .file-menu-item-title {
             font-size: 15px;
             color: var(--text);
@@ -1071,20 +1086,22 @@
         <div class="file-menu">
             <div class="file-menu-handle"></div>
             <div class="file-menu-title">选择文件类型</div>
-            <div class="file-menu-item" id="menuAnyFile">
+            <label class="file-menu-item file-menu-label" id="menuAnyFile">
+                <input type="file" id="fileInputAny" accept="*/*" multiple>
                 <div class="file-menu-item-icon">📁</div>
                 <div class="file-menu-item-text">
                     <div class="file-menu-item-title">任意文件</div>
                     <div class="file-menu-item-desc">选择任意类型的文件发送</div>
                 </div>
-            </div>
-            <div class="file-menu-item" id="menuImageVideo">
+            </label>
+            <label class="file-menu-item file-menu-label" id="menuImageVideo">
+                <input type="file" id="fileInputImageVideo" accept="image/*,video/*" multiple>
                 <div class="file-menu-item-icon">🖼️</div>
                 <div class="file-menu-item-text">
                     <div class="file-menu-item-title">图片/视频</div>
                     <div class="file-menu-item-desc">选择图片或视频文件发送</div>
                 </div>
-            </div>
+            </label>
             <button class="file-menu-cancel" id="fileMenuCancel">取消</button>
         </div>
     </div>
@@ -1097,8 +1114,7 @@
                 <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
             </svg>
         </button>
-        <input type="file" id="fileInput" accept="image/*,video/*" style="display: none;" multiple>
-        
+
         <div class="input-wrapper">
             <textarea 
                 class="message-input" 
@@ -1160,7 +1176,8 @@
         
         // 文件传输元素
         const fileBtn = document.getElementById('fileBtn');
-        const fileInput = document.getElementById('fileInput');
+        const fileInputAny = document.getElementById('fileInputAny');
+        const fileInputImageVideo = document.getElementById('fileInputImageVideo');
         const fileTransferOverlay = document.getElementById('fileTransferOverlay');
         const fileName = document.getElementById('fileName');
         const fileSize = document.getElementById('fileSize');
@@ -1591,7 +1608,7 @@
                             }
                         }
                     });
-                    renderMessages();
+                    debouncedRenderMessages();
                     scrollToBottom();
                     break;
                     
@@ -1604,11 +1621,11 @@
                         messages[existingIndex].id = data.data.id;
                         messages[existingIndex].status = 'sent';
                         messages[existingIndex].session_id = data.data.session_id;  // 关键：更新 session_id
-                        renderMessages();
+                        debouncedRenderMessages();
                     } else {
                         // 新消息，添加到列表
                         messages.push(data.data);
-                        renderMessages();
+                        debouncedRenderMessages();
                     }
                     scrollToBottom();
                     break;
@@ -1656,7 +1673,7 @@
                 case 'server_text':
                     // 服务端发来的文本消息
                     messages.push(data.data);
-                    renderMessages();
+                    debouncedRenderMessages();
                     scrollToBottom();
                     break;
                     
@@ -1670,14 +1687,15 @@
                         } else if (data.mime_type && data.mime_type.startsWith('video/')) {
                             mediaType = 'video';
                         }
+                        const isMyFile = data.login_id && data.login_id === currentLoginId;
                         const fileMsg = {
-                            id: Date.now(),
+                            id: 'file_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
                             text: `[文件] ${data.name} (${formatSize(data.size)})`,
                             preview: `[文件] ${data.name}`,
                             time: new Date().toISOString(),
-                            session_id: -Date.now(),
-                            device_name: '服务端',
-                            login_id: 'server',
+                            session_id: data.session_id || -Date.now(),
+                            device_name: data.device_name || '服务端',
+                            login_id: data.login_id || 'server',
                             media_type: mediaType,
                             media_url: mediaType ? dlUrl : '',
                             download_url: mediaType ? '' : dlUrl,
@@ -1686,9 +1704,9 @@
                             size: data.size
                         };
                         messages.push(fileMsg);
-                        renderMessages();
+                        debouncedRenderMessages();
                         scrollToBottom();
-                        showToast(`已接收文件: ${data.name}`, 'success');
+                        showToast(isMyFile ? `已发送文件: ${data.name}` : `已接收文件: ${data.name}`, 'success');
                     }
                     break;
                     
@@ -1713,6 +1731,26 @@
         // 滚动到底部
         function scrollToBottom() {
             historyContainer.scrollTop = historyContainer.scrollHeight;
+        }
+
+        // 图片加载失败时自动重试一次（避免快速重绘导致加载被中断）
+        window.retryImageLoad = function(img) {
+            if (img.dataset.retried) return;
+            img.dataset.retried = '1';
+            setTimeout(() => {
+                const sep = img.src.includes('?') ? '&' : '?';
+                img.src = img.src + sep + '_retry=' + Date.now();
+            }, 300);
+        };
+
+        // 防抖渲染，避免快速连续更新时反复重建 DOM 导致图片加载中断
+        let renderTimeout = null;
+        function debouncedRenderMessages() {
+            if (renderTimeout) clearTimeout(renderTimeout);
+            renderTimeout = setTimeout(() => {
+                renderTimeout = null;
+                renderMessages();
+            }, 80);
         }
 
         // 渲染消息列表
@@ -1790,7 +1828,7 @@
             
             let contentHtml = '';
             if (msg.media_type === 'image') {
-                contentHtml = `<img src="${msg.media_url}" style="max-width:100%;border-radius:8px;display:block;cursor:pointer;" alt="图片" onclick="window.open(this.src)">`;
+                contentHtml = `<img src="${msg.media_url}" style="max-width:100%;border-radius:8px;display:block;cursor:pointer;" alt="图片" onerror="retryImageLoad(this)" onclick="window.open(this.src)">`;
             } else if (msg.media_type === 'video') {
                 contentHtml = `<video src="${msg.media_url}" controls style="max-width:100%;border-radius:8px;display:block;"></video>`;
             } else if (msg.download_url) {
@@ -1876,7 +1914,7 @@
             };
             
             messages.push(msg);
-            renderMessages();
+            debouncedRenderMessages();
             // 滚动到底部显示最新消息
             scrollToBottom();
             
@@ -1983,20 +2021,6 @@
             fileMenuOverlay.classList.add('active');
         });
 
-        // 文件菜单项 - 任意文件
-        menuAnyFile.addEventListener('click', () => {
-            fileInput.setAttribute('accept', '*/*');
-            fileMenuOverlay.classList.remove('active');
-            fileInput.click();
-        });
-
-        // 文件菜单项 - 图片/视频
-        menuImageVideo.addEventListener('click', () => {
-            fileInput.setAttribute('accept', 'image/*,video/*');
-            fileMenuOverlay.classList.remove('active');
-            fileInput.click();
-        });
-
         // 文件菜单 - 取消按钮
         fileMenuCancel.addEventListener('click', () => {
             fileMenuOverlay.classList.remove('active');
@@ -2009,16 +2033,30 @@
             }
         });
 
-        // 文件选择
-        fileInput.addEventListener('change', (e) => {
-            const files = e.target.files;
+        // 文件选择统一处理
+        function handleFileSelect(e) {
+            const input = e.target;
+            // FileList 在某些浏览器里是 live 的，立即转成普通数组避免被清空
+            const files = Array.from(input.files || []);
             if (files.length > 0) {
-                // 目前一次只处理一个文件
-                sendFile(files[0]);
+                showToast(`检测到 ${files.length} 个文件，开始发送…`);
+                // 依次发送选中的多个文件
+                (async () => {
+                    for (let i = 0; i < files.length; i++) {
+                        const file = files[i];
+                        showToast(`发送第 ${i + 1}/${files.length} 个文件: ${file.name}`);
+                        await sendFile(file);
+                    }
+                    showToast('全部文件发送完成');
+                })();
             }
             // 清空选择，允许重复选择同一文件
-            fileInput.value = '';
-        });
+            input.value = '';
+            fileMenuOverlay.classList.remove('active');
+        }
+
+        fileInputAny.addEventListener('change', handleFileSelect);
+        fileInputImageVideo.addEventListener('change', handleFileSelect);
         
         // 取消传输
         cancelTransferBtn.addEventListener('click', () => {

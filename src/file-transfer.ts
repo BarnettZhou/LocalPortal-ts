@@ -72,7 +72,7 @@ export class FileTransferManager {
     const timestamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
     const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '');
     const tempName = `lportal_tmp_${timestamp}_${fileId}_${safeName}`;
-    const finalName = `lportal_${timestamp}_${safeName}`;
+    const finalName = `lportal_${timestamp}_${fileId}_${safeName}`;
     const tempPath = path.join(this.downloadDir, tempName);
     const finalPath = path.join(this.downloadDir, finalName);
 
